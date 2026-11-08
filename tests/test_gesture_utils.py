@@ -1,4 +1,8 @@
-from gesture_utils import GestureTracker, estimate_gesture_state
+from gesture_utils import (
+    GestureTracker,
+    estimate_gesture_state,
+    orient_cursor_for_display,
+)
 
 
 def _landmarks_with_pinch_distance(distance: float):
@@ -72,3 +76,98 @@ def test_tracker_reset_clears_transient_session_state():
     assert tracker.last_volume_time == 0.0
     assert tracker.palm_held_start == 0.0
     assert tracker.pos_history == []
+
+
+def _three_finger_landmarks(y_offset: float = 0.0):
+    points = [(0.5, 0.5 + y_offset, 0.0)] * 21
+    points[0] = (0.5, 0.8 + y_offset, 0.0)   # wrist
+    points[9] = (0.5, 0.5 + y_offset, 0.0)   # palm center / scale
+    points[4] = (0.5, 0.7 + y_offset, 0.0)   # thumb stays closed
+    points[8] = (0.42, 0.2 + y_offset, 0.0)
+    points[6] = (0.42, 0.3 + y_offset, 0.0)
+    points[12] = (0.50, 0.18 + y_offset, 0.0)
+    points[10] = (0.50, 0.28 + y_offset, 0.0)
+    points[16] = (0.58, 0.22 + y_offset, 0.0)
+    points[14] = (0.58, 0.32 + y_offset, 0.0)
+    points[20] = (0.66, 0.42 + y_offset, 0.0)
+    points[18] = (0.66, 0.35 + y_offset, 0.0)
+    return points
+
+
+def test_three_finger_vertical_motion_scrolls_down(monkeypatch):
+    tracker = GestureTracker()
+    ticks = iter([1.00, 1.05, 1.10, 1.15])
+    monkeypatch.setattr("gesture_utils.time.monotonic", lambda: next(ticks))
+
+    states = [
+        estimate_gesture_state(_three_finger_landmarks(offset), tracker=tracker)
+        for offset in (0.0, 0.06, 0.12, 0.18)
+    ]
+
+    assert states[-1]["action"] == "scroll_down"
+    assert states[-1]["gesture_name"].startswith("Three Finger Scroll")
+
+
+def test_tracker_reset_clears_scroll_cooldown():
+    tracker = GestureTracker()
+    tracker.last_scroll_time = 123.0
+    tracker.last_zoom_time = 124.0
+    tracker.two_hand_distance_history.append((0.5, 125.0))
+    tracker.reset()
+    assert tracker.last_scroll_time == 0.0
+    assert tracker.last_zoom_time == 0.0
+    assert tracker.two_hand_distance_history == []
+
+
+def _two_hands_at_distance(distance: float):
+    left = [(0.25, 0.5, 0.0)] * 21
+    right = [(0.75, 0.5, 0.0)] * 21
+    left[0] = (0.4 - distance / 2, 0.5, 0.0)
+    left[9] = (0.4 - distance / 2, 0.5, 0.0)
+    right[0] = (0.4 + distance / 2, 0.5, 0.0)
+    right[9] = (0.4 + distance / 2, 0.5, 0.0)
+    return [left, right]
+
+
+def test_two_hand_spread_triggers_browser_zoom_in(monkeypatch):
+    from gesture_utils import estimate_two_hand_zoom
+
+    tracker = GestureTracker()
+    ticks = iter([2.00, 2.05, 2.10, 2.15])
+    monkeypatch.setattr("gesture_utils.time.monotonic", lambda: next(ticks))
+    actions = [
+        estimate_two_hand_zoom(_two_hands_at_distance(distance), tracker)
+        for distance in (0.20, 0.25, 0.32, 0.40)
+    ]
+    assert "zoom_in" in actions
+
+
+def test_two_hand_zoom_requires_two_hands_and_resets_history():
+    from gesture_utils import estimate_two_hand_zoom
+
+    tracker = GestureTracker()
+    tracker.two_hand_distance_history.append((0.5, 1.0))
+    assert estimate_two_hand_zoom([_two_hands_at_distance(0.4)[0]], tracker) is None
+    assert tracker.two_hand_distance_history == []
+
+
+def test_two_hand_close_triggers_browser_zoom_out(monkeypatch):
+    from gesture_utils import estimate_two_hand_zoom
+
+    tracker = GestureTracker()
+    ticks = iter([3.00, 3.05, 3.10, 3.15])
+    monkeypatch.setattr("gesture_utils.time.monotonic", lambda: next(ticks))
+    actions = [
+        estimate_two_hand_zoom(_two_hands_at_distance(distance), tracker)
+        for distance in (0.42, 0.35, 0.27, 0.18)
+    ]
+    assert "zoom_out" in actions
+
+
+def test_cursor_coordinates_match_mirrored_camera_preview_by_default():
+    assert orient_cursor_for_display((0.2, 0.7)) == (0.2, 0.7)
+
+
+def test_cursor_axis_inversion_is_explicit_and_independent():
+    assert orient_cursor_for_display((0.2, 0.7), invert_x=True) == (0.8, 0.7)
+    assert orient_cursor_for_display((0.2, 0.7), invert_y=True) == (0.2, 0.30000000000000004)

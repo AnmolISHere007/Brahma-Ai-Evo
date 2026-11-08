@@ -27,6 +27,9 @@ class GestureTracker:
         self.last_peace_time = 0.0
         self.last_swipe_time = 0.0
         self.last_volume_time = 0.0
+        self.last_scroll_time = 0.0
+        self.last_zoom_time = 0.0
+        self.two_hand_distance_history: list[tuple[float, float]] = []
         self.palm_held_start = 0.0
         self.pos_history: list[tuple[float, float, float]] = []  # (x, y, timestamp)
 
@@ -37,8 +40,30 @@ class GestureTracker:
         self.last_peace_time = 0.0
         self.last_swipe_time = 0.0
         self.last_volume_time = 0.0
+        self.last_scroll_time = 0.0
+        self.last_zoom_time = 0.0
+        self.two_hand_distance_history.clear()
         self.palm_held_start = 0.0
         self.pos_history.clear()
+
+
+def orient_cursor_for_display(
+    cursor: tuple[float, float],
+    *,
+    invert_x: bool = False,
+    invert_y: bool = False,
+) -> tuple[float, float]:
+    """Apply optional axis inversion to normalized cursor coordinates.
+
+    The camera preview is mirrored before MediaPipe runs, so the default is
+    to preserve the detected coordinates. Inversion is an explicit UI option.
+    """
+    x, y = float(cursor[0]), float(cursor[1])
+    if invert_x:
+        x = 1.0 - x
+    if invert_y:
+        y = 1.0 - y
+    return x, y
 
 
 def estimate_gesture_state(
@@ -129,14 +154,22 @@ def estimate_gesture_state(
         # Keep last 0.35s
         tracker.pos_history = [p for p in tracker.pos_history if now - p[2] <= 0.35]
 
-        if len(tracker.pos_history) >= 4 and (now - tracker.last_swipe_time) > 0.75:
-            start_x = tracker.pos_history[0][0]
-            end_x = tracker.pos_history[-1][0]
-            dt = tracker.pos_history[-1][2] - tracker.pos_history[0][2]
+        if len(tracker.pos_history) >= 4:
+            start_x, start_y, start_time = tracker.pos_history[0]
+            end_x, end_y, end_time = tracker.pos_history[-1]
+            dt = end_time - start_time
             dx = end_x - start_x
+            dy = end_y - start_y
+            three_finger_scroll = index_open and middle_open and ring_open and not pinky_open
 
-            # Fast horizontal movement
-            if dt > 0.03 and abs(dx) > 0.15:
+            # Three raised fingers provide a deliberate vertical-scroll gesture.
+            if three_finger_scroll and dt > 0.03 and abs(dy) > 0.14 and (now - tracker.last_scroll_time) > 0.55:
+                swipe_action = "scroll_down" if dy > 0 else "scroll_up"
+                gesture_name = "Three Finger Scroll ↓" if dy > 0 else "Three Finger Scroll ↑"
+                tracker.last_scroll_time = now
+                tracker.pos_history.clear()
+            # Horizontal swipes retain the existing media/slide controls.
+            elif (now - tracker.last_swipe_time) > 0.75 and dt > 0.03 and abs(dx) > 0.15:
                 if dx > 0.15:
                     swipe_action = "swipe_right"
                     gesture_name = "Swipe Right 👉"
@@ -151,6 +184,10 @@ def estimate_gesture_state(
 
     elif pinch:
         gesture_name = "Pinch"
+
+    # Three raised fingers are reserved for vertical scrolling (handled above).
+    elif index_open and middle_open and ring_open and not pinky_open:
+        gesture_name = "Three Finger Scroll"
 
     # ✌️ Peace Sign (Index + Middle open, Ring + Pinky closed) -> Screenshot
     elif index_open and middle_open and not ring_open and not pinky_open:
@@ -207,3 +244,42 @@ def estimate_gesture_state(
         "gesture_name": gesture_name,
         "action": action,
     }
+
+
+def estimate_two_hand_zoom(
+    hands: Optional[Iterable[Iterable[tuple[float, float, float]]]],
+    tracker: Optional[GestureTracker] = None,
+) -> Optional[str]:
+    """Detect a deliberate two-hand spread/close motion as browser zoom."""
+    if tracker is None:
+        return None
+    hand_list = [list(hand) for hand in (hands or [])]
+    if len(hand_list) < 2 or any(len(hand) < 10 for hand in hand_list[:2]):
+        tracker.two_hand_distance_history.clear()
+        return None
+
+    now = time.monotonic()
+    centers = []
+    for hand in hand_list[:2]:
+        wrist, middle_mcp = hand[0], hand[9]
+        centers.append(((wrist[0] + middle_mcp[0]) / 2.0, (wrist[1] + middle_mcp[1]) / 2.0))
+    distance = math.hypot(centers[0][0] - centers[1][0], centers[0][1] - centers[1][1])
+
+    history = tracker.two_hand_distance_history
+    history.append((distance, now))
+    tracker.two_hand_distance_history = [item for item in history if now - item[1] <= 0.45]
+    history = tracker.two_hand_distance_history
+    if len(history) < 3 or now - history[0][1] < 0.08 or now - tracker.last_zoom_time < 0.9:
+        return None
+
+    change = history[-1][0] - history[0][0]
+    if change > 0.10:
+        action = "zoom_in"
+    elif change < -0.10:
+        action = "zoom_out"
+    else:
+        return None
+
+    tracker.last_zoom_time = now
+    tracker.two_hand_distance_history.clear()
+    return action
